@@ -1,0 +1,24 @@
+{
+  "name": "acp-provider",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node seller.js",
+    "start:seller": "node seller.js",
+    "start:resources": "node resources-server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@virtuals-protocol/acp-node": "^0.3.0-beta.13",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.15.0",
+    "express": "^5.2.1"
+  }
+}
