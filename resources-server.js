@@ -31,7 +31,6 @@ function makeResponse(data, metaExtra = {}) {
 
 // -------------------------------------------------------------
 // In-memory “databases” for SAIQUE resources
-// (You can later swap these for a real DB or static JSON files.)
 // -------------------------------------------------------------
 
 // 1) Vulnerability knowledge base
@@ -248,18 +247,19 @@ const VERIFICATION_TEMPLATES = {
   "ethereum-mainnet": {
     chain: "ethereum-mainnet",
     steps: [
-      "Ensure contracts are compiled with the same version as in production",
-      "Confirm license identifiers (e.g., MIT, GPL-3.0)",
+      "Ensure contracts are compiled with the correct production version",
+      "Confirm license identifiers",
       "Use verified library addresses if linked",
-      "Document who signs off on final explorer verification"
+      "Document sign-off requirements"
     ]
   }
 };
 
 // -------------------------------------------------------------
 // Routes
-// Base health check
 // -------------------------------------------------------------
+
+// Health check
 app.get("/", (req, res) => {
   res.json(
     makeResponse(
@@ -281,8 +281,7 @@ app.get("/", (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 1) /resources/vuln-db
-//    Optional query: ?vuln=delegatecall_untrusted
+// 1) Vulnerability DB
 // -------------------------------------------------------------
 app.get("/resources/vuln-db", (req, res) => {
   const { vuln } = req.query;
@@ -292,32 +291,38 @@ app.get("/resources/vuln-db", (req, res) => {
     if (!record) {
       return res.status(404).json({
         ok: false,
-        error: `Vulnerability '${vuln}' not found in SAIQUE vuln-db.`,
+        error: `Vulnerability '${vuln}' not found.`,
         meta: { timestamp_utc: new Date().toISOString() }
       });
     }
     return res.json(makeResponse(record, { route: "vuln-db", filter: vuln }));
   }
 
-  // No filter → return catalog
   res.json(
     makeResponse(
-      {
-        count: Object.keys(VULN_DB).length,
-        entries: VULN_DB
-      },
+      { count: Object.keys(VULN_DB).length, entries: VULN_DB },
       { route: "vuln-db" }
     )
   );
 });
 
 // -------------------------------------------------------------
-// 2) /resources/severity-standard
-//    Optional query: ?section=high
+// 2) Severity Standard  (updated with overview support)
 // -------------------------------------------------------------
 app.get("/resources/severity-standard", (req, res) => {
   const { section } = req.query;
 
+  // NEW — overview returns entire table
+  if (section && section.toLowerCase() === "overview") {
+    return res.json(
+      makeResponse(SEVERITY_STANDARD, {
+        route: "severity-standard",
+        section: "overview"
+      })
+    );
+  }
+
+  // Specific section
   if (section) {
     const sec = SEVERITY_STANDARD[section.toLowerCase()];
     if (!sec) {
@@ -332,12 +337,12 @@ app.get("/resources/severity-standard", (req, res) => {
     );
   }
 
+  // No section → return entire table
   res.json(makeResponse(SEVERITY_STANDARD, { route: "severity-standard" }));
 });
 
 // -------------------------------------------------------------
-// 3) /resources/threat-matrix
-//    Optional query: ?chain=base  (default: base)
+// 3) Threat Matrix
 // -------------------------------------------------------------
 app.get("/resources/threat-matrix", (req, res) => {
   const chainKey = (req.query.chain || "base").toLowerCase();
@@ -352,22 +357,16 @@ app.get("/resources/threat-matrix", (req, res) => {
   if (!mapping) {
     return res.status(404).json({
       ok: false,
-      error: `No threat matrix available for chain '${chainKey}'.`,
+      error: `No threat matrix for '${chainKey}'.`,
       meta: { timestamp_utc: new Date().toISOString() }
     });
   }
 
-  res.json(
-    makeResponse(mapping, {
-      route: "threat-matrix",
-      chain: chainKey
-    })
-  );
+  res.json(makeResponse(mapping, { route: "threat-matrix", chain: chainKey }));
 });
 
 // -------------------------------------------------------------
-// 4) /resources/solidity-patterns
-//    Optional query: ?category=defensive
+// 4) Solidity Patterns
 // -------------------------------------------------------------
 app.get("/resources/solidity-patterns", (req, res) => {
   const { category } = req.query;
@@ -378,10 +377,7 @@ app.get("/resources/solidity-patterns", (req, res) => {
     );
     return res.json(
       makeResponse(
-        {
-          count: filtered.length,
-          patterns: filtered
-        },
+        { count: filtered.length, patterns: filtered },
         { route: "solidity-patterns", category }
       )
     );
@@ -389,53 +385,38 @@ app.get("/resources/solidity-patterns", (req, res) => {
 
   res.json(
     makeResponse(
-      {
-        count: SOLIDITY_PATTERNS.length,
-        patterns: SOLIDITY_PATTERNS
-      },
+      { count: SOLIDITY_PATTERNS.length, patterns: SOLIDITY_PATTERNS },
       { route: "solidity-patterns" }
     )
   );
 });
 
 // -------------------------------------------------------------
-// 5) /resources/pipeline-baselines
-//    Optional query: ?environment=prod | default
+// 5) Pipeline Baselines
 // -------------------------------------------------------------
 app.get("/resources/pipeline-baselines", (req, res) => {
   const env = (req.query.environment || "default").toLowerCase();
   const baseline = PIPELINE_BASELINES[env] || PIPELINE_BASELINES.default;
 
-  res.json(
-    makeResponse(baseline, {
-      route: "pipeline-baselines",
-      environment: env
-    })
-  );
+  res.json(makeResponse(baseline, { route: "pipeline-baselines", environment: env }));
 });
 
 // -------------------------------------------------------------
-// 6) /resources/deployment-safety-checklist
-//    Optional query: ?network=base | generic
+// 6) Deployment Safety Checklist
 // -------------------------------------------------------------
 app.get("/resources/deployment-safety-checklist", (req, res) => {
   const networkKey = (req.query.network || "base").toLowerCase();
 
-  let checklist = null;
-  if (networkKey === "base") checklist = DEPLOYMENT_CHECKLIST.base;
-  else checklist = DEPLOYMENT_CHECKLIST.generic;
+  const checklist =
+    networkKey === "base"
+      ? DEPLOYMENT_CHECKLIST.base
+      : DEPLOYMENT_CHECKLIST.generic;
 
-  res.json(
-    makeResponse(checklist, {
-      route: "deployment-safety-checklist",
-      network: networkKey
-    })
-  );
+  res.json(makeResponse(checklist, { route: "deployment-safety-checklist", network: networkKey }));
 });
 
 // -------------------------------------------------------------
-// 7) /resources/verification-readiness-templates
-//    Optional query: ?chain=base | ethereum-mainnet
+// 7) Verification Readiness Templates
 // -------------------------------------------------------------
 app.get("/resources/verification-readiness-templates", (req, res) => {
   const chainKey = (req.query.chain || "base").toLowerCase();
@@ -448,7 +429,7 @@ app.get("/resources/verification-readiness-templates", (req, res) => {
   if (!tmpl) {
     return res.status(404).json({
       ok: false,
-      error: `No verification readiness template for chain '${chainKey}'.`,
+      error: `No verification template for '${chainKey}'.`,
       meta: { timestamp_utc: new Date().toISOString() }
     });
   }
