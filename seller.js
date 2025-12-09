@@ -7,6 +7,80 @@ const { AcpContractClientV2 } = AcpClientModule;
 // Cache job metadata so we can use it later when job.input is empty
 const jobCache = new Map(); // key: job.id, value: { name, requirement }
 
+// ---------------------------------------------------------------------------
+// Resource config + helpers
+// ---------------------------------------------------------------------------
+
+const RESOURCES_BASE =
+  process.env.SAIQUE_RESOURCES_BASE ||
+  "https://saique-sentinel-resources.onrender.com/resources";
+
+const vulnCache = new Map(); // key: vuln id -> meta
+const mitigationCache = new Map(); // key: mitigation key -> meta
+
+async function fetchJson(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.warn("⚠️ fetchJson non-OK response:", res.status, url);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    console.warn("⚠️ fetchJson error for URL:", url, err.message || err);
+    return null;
+  }
+}
+
+async function fetchVulnMeta(vulnId) {
+  if (!vulnId) return null;
+  if (vulnCache.has(vulnId)) return vulnCache.get(vulnId);
+
+  const url = `${RESOURCES_BASE}/vuln-db?vuln=${encodeURIComponent(vulnId)}`;
+  const data = await fetchJson(url);
+  if (data) {
+    vulnCache.set(vulnId, data);
+  }
+  return data;
+}
+
+async function fetchMitigationMeta(key) {
+  if (!key) return null;
+  if (mitigationCache.has(key)) return mitigationCache.get(key);
+
+  const url = `${RESOURCES_BASE}/mitigation-playbook?key=${encodeURIComponent(
+    key
+  )}`;
+  const data = await fetchJson(url);
+  if (data) {
+    mitigationCache.set(key, data);
+  }
+  return data;
+}
+
+/**
+ * Merge fields from src into dst, but do NOT overwrite existing non-empty values.
+ */
+function softMerge(dst, src) {
+  if (!dst || !src) return;
+  for (const [k, v] of Object.entries(src)) {
+    if (v === undefined || v === null) continue;
+    const existing = dst[k];
+    const isEmptyString = typeof existing === "string" && existing.trim() === "";
+    if (
+      existing === undefined ||
+      existing === null ||
+      isEmptyString
+    ) {
+      dst[k] = v;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Job type inference
+// ---------------------------------------------------------------------------
+
 /**
  * Infer job type from job name (offering name).
  */
@@ -31,9 +105,6 @@ function inferJobTypeFromName(name) {
   }
   if (jt.includes("deployment_safety_review")) {
     return "deployment_safety_review";
-  }
-  if (jt.includes("verification_readiness_checklist")) {
-    return "verification_readiness_checklist";
   }
 
   return null;
@@ -78,14 +149,6 @@ function inferJobTypeFromInput(input) {
     input.settings !== null
   ) {
     return "deployment_safety_review";
-  }
-
-  // 5) Verification readiness checklist: chain + artifact_url
-  if (
-    typeof input.chain === "string" &&
-    typeof input.artifact_url === "string"
-  ) {
-    return "verification_readiness_checklist";
   }
 
   return "unknown";
@@ -182,7 +245,7 @@ function fallbackBestEffortDeliverable(input) {
         description:
           "The input did not clearly match any known schema, so a specific security review could not be performed.",
         suggestion:
-          "Ensure that the input follows the expected schema for one of: smart_contract_static_pattern_analysis, devops_pipeline_security_review_v2, threat_model_generator, deployment_safety_review, or verification_readiness_checklist."
+          "Ensure that the input follows the expected schema for one of: smart_contract_static_pattern_analysis, devops_pipeline_security_review_v2, threat_model_generator, or deployment_safety_review."
       }
     ],
     severity_breakdown: {
@@ -218,7 +281,6 @@ function severityWeight(sev) {
 
 /**
  * 1) smart_contract_static_pattern_analysis
- * Richer audit-style deliverable with coverage, remediation plan, open questions.
  */
 function analyzeSmartContractStatic(input) {
   const code = input.code || "";
@@ -238,7 +300,6 @@ function analyzeSmartContractStatic(input) {
 
   const addFinding = (f) => findings.push(f);
 
-  // Simple coverage tracking: what categories we checked and whether they triggered
   const coverage = {
     pragma_version: { checked: true, triggered: false },
     delegatecall_usage: { checked: true, triggered: false },
@@ -251,7 +312,6 @@ function analyzeSmartContractStatic(input) {
     basic_reentrancy_heuristics: { checked: true, triggered: false }
   };
 
-  // --- Basic metadata / context checks ---
   const pragmaMatch = code.match(/pragma\s+solidity\s+([^;]+);/i);
   const pragma = pragmaMatch ? pragmaMatch[1].trim() : null;
 
@@ -272,8 +332,6 @@ function analyzeSmartContractStatic(input) {
         "Add an explicit pragma such as `pragma solidity 0.8.24;` and pin it to a known-tested version for production deployments."
     });
   }
-
-  // --- Critical / High patterns ---
 
   if (code.includes("delegatecall")) {
     coverage.delegatecall_usage.triggered = true;
@@ -351,8 +409,6 @@ function analyzeSmartContractStatic(input) {
     });
   }
 
-  // --- Medium patterns / best practices ---
-
   if (code.includes("block.timestamp") || code.includes("now")) {
     coverage.timestamp_dependency.triggered = true;
     addFinding({
@@ -372,7 +428,6 @@ function analyzeSmartContractStatic(input) {
     });
   }
 
-  // Simple “upgradeable proxy” heuristic
   if (/proxy/i.test(code) && /implementation/i.test(code)) {
     coverage.upgradeable_proxy_pattern.triggered = true;
     addFinding({
@@ -392,7 +447,6 @@ function analyzeSmartContractStatic(input) {
     });
   }
 
-  // Access control heuristic: if no onlyOwner/onlyRole anywhere, flag
   if (!/onlyOwner|onlyRole|AccessControl/i.test(code)) {
     coverage.access_control_modifiers.triggered = true;
     addFinding({
@@ -412,7 +466,6 @@ function analyzeSmartContractStatic(input) {
     });
   }
 
-  // Very rough reentrancy heuristic: both external calls and "balance" updates present
   if (
     /call{value:|call.value\(|transfer\(|send\(/.test(code) &&
     /(balance|balances)\s*\[/.test(code)
@@ -435,7 +488,6 @@ function analyzeSmartContractStatic(input) {
     });
   }
 
-  // If nothing matched, still provide a meaningful “no major patterns” result
   if (findings.length === 0) {
     addFinding({
       id: "no_pattern_hits",
@@ -445,8 +497,7 @@ function analyzeSmartContractStatic(input) {
         "The heuristic scan did not detect any of the typical high-risk patterns it looks for.",
       impact:
         "This does NOT mean the contract is safe; many vulnerabilities require deeper contextual or dynamic analysis.",
-      likelihood:
-        "N/A – this is an informational result.",
+      likelihood: "N/A – this is an informational result.",
       evidence:
         "No occurrences of known patterns such as delegatecall, tx.origin, selfdestruct, or risky low-level calls were found.",
       suggestion:
@@ -454,7 +505,6 @@ function analyzeSmartContractStatic(input) {
     });
   }
 
-  // Severity breakdown
   const severity_breakdown = {
     critical: findings.filter((f) => f.severity === "critical").length,
     high: findings.filter((f) => f.severity === "high").length,
@@ -480,7 +530,6 @@ function analyzeSmartContractStatic(input) {
       ? "low"
       : "info";
 
-  // Remediation plan: sort findings by severity weight
   const sortedForRemediation = [...findings].sort(
     (a, b) => severityWeight(b.severity) - severityWeight(a.severity)
   );
@@ -499,7 +548,6 @@ function analyzeSmartContractStatic(input) {
       }`
   );
 
-  // Open questions for human follow-up
   const open_questions = [];
   if (coverage.upgradeable_proxy_pattern.triggered) {
     open_questions.push(
@@ -544,7 +592,6 @@ function analyzeSmartContractStatic(input) {
 
 /**
  * 2) devops_pipeline_security_review_v2
- * Richer CI/CD report-style deliverable with coverage, remediation plan, open questions.
  */
 function analyzeDevopsPipeline(input) {
   const pipeline = input.pipeline_yaml || input.pipeline || "";
@@ -575,7 +622,6 @@ function analyzeDevopsPipeline(input) {
     prod_approval_gates: { checked: true, triggered: false }
   };
 
-  // Privileged containers / escalation
   if (
     lower.includes("privileged: true") ||
     lower.includes("allow_privilege_escalation: true")
@@ -598,7 +644,6 @@ function analyzeDevopsPipeline(input) {
     });
   }
 
-  // :latest tags
   if (lower.includes(":latest")) {
     coverage.latest_tags.triggered = true;
     addThreat({
@@ -609,15 +654,13 @@ function analyzeDevopsPipeline(input) {
         "The pipeline uses container images tagged as `:latest`.",
       impact:
         "Reproducibility and auditability are reduced; upstream image changes can silently alter your CI environment.",
-      likelihood:
-        "High – image maintainers routinely update `:latest` tags.",
+      likelihood: "High – image maintainers routinely update `:latest` tags.",
       evidence: "Occurrences of `:latest` tags in image references.",
       mitigation:
         "Pin images to explicit versions (e.g., `node:22.2`) or digests, and update them on a controlled cadence."
     });
   }
 
-  // Security scanning
   const hasSecurityScan =
     lower.includes("snyk") ||
     lower.includes("trivy") ||
@@ -648,7 +691,6 @@ function analyzeDevopsPipeline(input) {
     });
   }
 
-  // Inline secrets
   const hasInlineSecrets =
     /password\s*=\s*["']?[A-Za-z0-9]/i.test(pipeline) ||
     /secret\s*=\s*["']?[A-Za-z0-9]/i.test(pipeline) ||
@@ -674,7 +716,6 @@ function analyzeDevopsPipeline(input) {
     });
   }
 
-  // Prod environment without manual approvals
   if (isProd) {
     const hasApproval =
       lower.includes("manual_approval") ||
@@ -739,7 +780,6 @@ function analyzeDevopsPipeline(input) {
       ? "low"
       : "info";
 
-  // Remediation plan
   const sortedForRemediation = [...threats].sort(
     (a, b) => severityWeight(b.severity) - severityWeight(a.severity)
   );
@@ -806,54 +846,408 @@ function analyzeDevopsPipeline(input) {
 }
 
 /**
- * 3) threat_model_generator
+ * 3) threat_model_generator (architecture-aware)
  */
 function analyzeThreatModel(input) {
   const architecture = input.architecture_summary || "";
 
+  const lower = architecture.toLowerCase();
+
+  const features = {
+    hasOauth:
+      /oauth|oidc|openid connect|sso|single sign[- ]on|identity provider|idp/.test(
+        lower
+      ),
+    hasJwt: /jwt|json web token/.test(lower),
+    hasFileUpload:
+      /file upload|multipart|s3 bucket|blob storage|gcs bucket|upload endpoint|cdn upload/.test(
+        lower
+      ),
+    hasAdminPanel:
+      /admin panel|admin ui|backoffice|back office|staff console/.test(lower),
+    hasRBAC: /rbac|role[- ]based access|roles? and permissions?/.test(lower),
+    hasExternalApi:
+      /stripe|paypal|slack|salesforce|webhook|web hook|third[- ]party api|external api|partner api/.test(
+        lower
+      ),
+    hasQueue:
+      /queue|kafka|rabbitmq|sqs|pubsub|pub\/sub|message bus|event bus/.test(
+        lower
+      ),
+    hasDb:
+      /database|db server|sql|postgres|mysql|dynamodb|mongodb|nosql|warehouse/.test(
+        lower
+      ),
+    hasFrontend:
+      /web app|frontend|spa|react|next\.js|vue|angular|browser client/.test(
+        lower
+      ),
+    hasApi:
+      /api gateway|rest api|graphql|grpc endpoint|backend api|bff/.test(lower)
+  };
+
+  const components = [];
+
+  if (features.hasFrontend) {
+    components.push({
+      id: "frontend",
+      name: "Web Frontend",
+      type: "client",
+      description:
+        "Browser-based client used by end users to authenticate and interact with the application."
+    });
+  }
+
+  if (features.hasApi) {
+    components.push({
+      id: "api",
+      name: "Backend API / BFF",
+      type: "service",
+      description:
+        "Backend API or backend-for-frontend that handles business logic and data access."
+    });
+  }
+
+  if (features.hasOauth || features.hasJwt) {
+    components.push({
+      id: "authz",
+      name: "Auth / OAuth / Identity Provider",
+      type: "service",
+      description:
+        "Authentication and authorization layer using OAuth/OIDC/JWT tokens."
+    });
+  }
+
+  if (features.hasAdminPanel || features.hasRBAC) {
+    components.push({
+      id: "admin",
+      name: "Admin Panel with RBAC",
+      type: "service",
+      description:
+        "Administrative or internal user interface with role-based access control over privileged actions."
+    });
+  }
+
+  if (features.hasFileUpload) {
+    components.push({
+      id: "uploads",
+      name: "File Upload & Storage",
+      type: "service",
+      description:
+        "Endpoints and storage for user-uploaded files (e.g., S3 buckets, blob storage, CDN)."
+    });
+  }
+
+  if (features.hasExternalApi) {
+    components.push({
+      id: "integrations",
+      name: "External Integrations",
+      type: "service",
+      description:
+        "Outbound / inbound integrations with third-party APIs (payments, notifications, CRMs, webhooks, etc.)."
+    });
+  }
+
+  if (features.hasQueue) {
+    components.push({
+      id: "mq",
+      name: "Message Queue / Event Bus",
+      type: "infra",
+      description:
+        "Asynchronous messaging infrastructure used for background jobs, events, or decoupled services."
+    });
+  }
+
+  if (features.hasDb) {
+    components.push({
+      id: "db",
+      name: "Primary Database",
+      type: "data",
+      description:
+        "Persistent storage for core application data (user accounts, configuration, business records)."
+    });
+  }
+
+  if (components.length === 0) {
+    components.push({
+      id: "core",
+      name: "Core Application",
+      type: "service",
+      description:
+        "High-level system components were not clearly identifiable; treating the application as a single logical component."
+    });
+  }
+
   const assets = [];
-  if (/user|customer/i.test(architecture)) {
-    assets.push("User accounts and personal data");
+  if (/user|customer|account/i.test(architecture)) {
+    assets.push("User accounts, sessions, and personal data");
   }
-  if (/payment|funds|wallet|token/i.test(architecture)) {
-    assets.push("Financial assets / tokens");
+  if (/payment|funds|wallet|token|invoice|billing/i.test(architecture)) {
+    assets.push("Financial assets, payment info, and transactional records");
   }
-  if (/admin|backoffice|ops/i.test(architecture)) {
-    assets.push("Administrative controls and tooling");
+  if (features.hasAdminPanel || features.hasRBAC) {
+    assets.push("Administrative privileges and configuration state");
+  }
+  if (features.hasFileUpload) {
+    assets.push("Uploaded files and associated metadata");
   }
   if (assets.length === 0) {
-    assets.push("Core application data and availability");
+    assets.push("Core application data and service availability");
   }
 
   const attack_surfaces = [];
-  if (/api|endpoint|rest|graphql/i.test(architecture)) {
-    attack_surfaces.push("Public or partner APIs");
-  }
-  if (/web|frontend|spa|browser/i.test(architecture)) {
-    attack_surfaces.push("Web front-end");
-  }
-  if (/mobile|android|ios/i.test(architecture)) {
-    attack_surfaces.push("Mobile applications");
-  }
-  if (/database|db|sql|storage/i.test(architecture)) {
-    attack_surfaces.push("Data storage / databases");
-  }
-  if (attack_surfaces.length === 0) {
-    attack_surfaces.push("Primary application entry points");
+
+  if (features.hasFrontend) {
+    attack_surfaces.push({
+      id: "surface_frontend",
+      name: "Public Web Frontend",
+      description:
+        "Browser-accessible pages and client-side code exposed to the internet."
+    });
   }
 
-  const threats = attack_surfaces.map((surface, idx) => ({
-    id: `tm_${idx + 1}`,
-    surface,
-    stride_category:
-      idx === 0
-        ? "Spoofing / Elevation of Privilege"
-        : "Information Disclosure / Tampering",
-    severity: idx === 0 ? "high" : "medium",
-    description: `Potential attacks against ${surface}, such as unauthorized access, abuse of functionality and data exfiltration.`,
-    mitigation:
-      "Apply strong authentication, authorization, input validation, rate limiting, logging/monitoring and secure configurations."
-  }));
+  if (features.hasApi) {
+    attack_surfaces.push({
+      id: "surface_api",
+      name: "Public / Partner API",
+      description:
+        "REST/GraphQL/gRPC endpoints accepting requests from clients or partners."
+    });
+  }
+
+  if (features.hasFileUpload) {
+    attack_surfaces.push({
+      id: "surface_uploads",
+      name: "File Upload Endpoints",
+      description:
+        "Endpoints that accept and process user-controlled files for storage or further processing."
+    });
+  }
+
+  if (features.hasAdminPanel) {
+    attack_surfaces.push({
+      id: "surface_admin",
+      name: "Admin Panel",
+      description:
+        "Privileged administrative interface accessible by staff or internal users."
+    });
+  }
+
+  if (features.hasExternalApi) {
+    attack_surfaces.push({
+      id: "surface_integrations",
+      name: "Third-Party Integrations / Webhooks",
+      description:
+        "Inbound webhooks and outbound calls to external SaaS APIs and partner systems."
+    });
+  }
+
+  if (attack_surfaces.length === 0) {
+    attack_surfaces.push({
+      id: "surface_core",
+      name: "Primary Application Entry Points",
+      description:
+        "Unspecified public interfaces used by users or systems to interact with the app."
+    });
+  }
+
+  const threats = [];
+
+  const addThreat = (t) => threats.push(t);
+
+  if (features.hasOauth || features.hasJwt) {
+    addThreat({
+      id: "tm_auth_token_misuse",
+      surface: "Auth / OAuth / Identity Provider",
+      component_id: "authz",
+      stride_category: "Spoofing / Elevation of Privilege",
+      severity: "high",
+      description:
+        "Misconfigured OAuth/OIDC or JWT validation could allow attackers to forge or replay tokens to impersonate users or escalate privileges.",
+      example_attack_paths: [
+        "Attacker crafts or steals a JWT, bypasses audience/issuer checks, and calls backend APIs as a higher-privilege user."
+      ],
+      mitigation:
+        "Enforce strict issuer/audience checks, validate token signatures against trusted keys, require short token lifetimes with refresh tokens, and lock down redirect URIs and client secrets."
+    });
+  }
+
+  if (features.hasFileUpload) {
+    addThreat({
+      id: "tm_file_upload_rce_xss",
+      surface: "File Upload Endpoints",
+      component_id: "uploads",
+      stride_category: "Tampering / Information Disclosure",
+      severity: "high",
+      description:
+        "Unvalidated file uploads could lead to stored XSS, malware distribution, or remote code execution if files are processed insecurely.",
+      example_attack_paths: [
+        "Attacker uploads a crafted HTML/JS file that is served from the same origin without proper content-type and content-disposition headers, leading to stored XSS.",
+        "Attacker uploads a malicious file that is processed by an image/PDF library with known vulnerabilities, leading to RCE on the worker."
+      ],
+      mitigation:
+        "Enforce strict allow-lists on MIME types and extensions, scan uploads for malware, store files on isolated domains with safe content-types, and avoid passing user-controlled files directly to high-risk processing libraries."
+    });
+  }
+
+  if (features.hasAdminPanel || features.hasRBAC) {
+    addThreat({
+      id: "tm_admin_rbac_bypass",
+      surface: "Admin Panel",
+      component_id: "admin",
+      stride_category: "Elevation of Privilege / Tampering",
+      severity: "high",
+      description:
+        "Weak or inconsistent RBAC in admin workflows could allow standard users to perform privileged actions or abuse hidden endpoints.",
+      example_attack_paths: [
+        "Attacker finds an admin-only API endpoint that only checks authentication but not role membership, and uses it to change configuration or user roles."
+      ],
+      mitigation:
+        "Centralize RBAC checks, enforce least privilege roles, ensure every admin endpoint checks both authentication and authorization, and log/alert on unusual admin activity."
+    });
+  }
+
+  if (features.hasExternalApi) {
+    addThreat({
+      id: "tm_third_party_integrations",
+      surface: "Third-Party Integrations / Webhooks",
+      component_id: "integrations",
+      stride_category: "Tampering / Repudiation",
+      severity: "medium",
+      description:
+        "Unverified webhooks or over-privileged outbound API keys can allow attackers or compromised SaaS providers to inject or manipulate data.",
+      example_attack_paths: [
+        "Attacker sends forged webhook requests without signature validation, causing unauthorized state changes (e.g., marking invoices as paid)."
+      ],
+      mitigation:
+        "Validate webhook signatures and source IPs, scope third-party API keys to minimal permissions, and add idempotency and sanity checks to inbound events."
+    });
+  }
+
+  if (features.hasApi) {
+    addThreat({
+      id: "tm_api_abuse",
+      surface: "Public / Partner API",
+      component_id: "api",
+      stride_category: "Denial of Service / Information Disclosure",
+      severity: "medium",
+      description:
+        "Public APIs without proper throttling, authentication, or authorization can be abused for data scraping, brute forcing, or DoS.",
+      example_attack_paths: [
+        "Attacker scripts high-volume requests to enumeration endpoints to scrape user data or exhaust backend resources."
+      ],
+      mitigation:
+        "Enforce authentication and authorization on sensitive endpoints, add rate limiting and anomaly detection, and minimize verbose error responses."
+    });
+  }
+
+  if (features.hasQueue) {
+    addThreat({
+      id: "tm_queue_poisoning",
+      surface: "Message Queue / Event Bus",
+      component_id: "mq",
+      stride_category: "Tampering / Denial of Service",
+      severity: "medium",
+      description:
+        "If message producers or consumers are insufficiently authenticated, attackers may inject or replay messages, causing inconsistent state or overload.",
+      example_attack_paths: [
+        "Compromised service credentials allow an attacker to flood the queue with bogus events, starving legitimate processing."
+      ],
+      mitigation:
+        "Restrict queue access with strong IAM, validate message schemas, implement dead-letter queues, and monitor for unusual volume or patterns."
+    });
+  }
+
+  if (features.hasDb) {
+    addThreat({
+      id: "tm_db_data_breach",
+      surface: "Primary Database",
+      component_id: "db",
+      stride_category: "Information Disclosure / Tampering",
+      severity: "high",
+      description:
+        "Weak segregation, injection vulnerabilities, or misconfigured IAM could lead to bulk extraction or modification of sensitive data.",
+      example_attack_paths: [
+        "SQL injection in API layer lets attacker dump the user table, including PII and auth data."
+      ],
+      mitigation:
+        "Use parameterized queries/ORM, separate write/read roles, encrypt sensitive fields at rest, and monitor access patterns."
+    });
+  }
+
+  if (threats.length === 0) {
+    threats.push({
+      id: "tm_generic",
+      surface: "Primary Application Entry Points",
+      component_id: components[0].id,
+      stride_category: "Generic – multiple STRIDE categories",
+      severity: "medium",
+      description:
+        "High-level threats exist around authentication, authorization, data validation and logging, but no specific patterns could be identified from the summary.",
+      example_attack_paths: [],
+      mitigation:
+        "Apply defense-in-depth: strong authn/z, input validation, least privilege access to data stores, centralized logging, and alerting for anomalous activity."
+    });
+  }
+
+  const attack_paths = [];
+
+  if (features.hasFrontend && features.hasApi && features.hasDb) {
+    attack_paths.push({
+      id: "path_frontend_api_db",
+      description:
+        "Internet attacker compromises user via the frontend to reach sensitive data in the DB through the API.",
+      steps: [
+        "Attacker sends malicious input through the web frontend.",
+        "Frontend forwards the request to the backend API.",
+        "Backend API processes insufficiently validated input.",
+        "Attacker exploits injection or authz flaws to read/modify records in the database."
+      ],
+      risk_level: "high"
+    });
+  }
+
+  if (features.hasAdminPanel && features.hasOauth) {
+    attack_paths.push({
+      id: "path_oauth_admin_takeover",
+      description:
+        "Attacker abuses OAuth misconfiguration or token handling to gain access to the admin panel.",
+      steps: [
+        "Attacker obtains or forges an OAuth/JWT token due to configuration or validation flaws.",
+        "Attacker uses the token to access the admin panel as a privileged user.",
+        "Attacker changes roles, configuration, or user data through admin endpoints."
+      ],
+      risk_level: "high"
+    });
+  }
+
+  if (features.hasFileUpload && features.hasExternalApi) {
+    attack_paths.push({
+      id: "path_upload_integrations",
+      description:
+        "Attacker leverages file uploads to trigger dangerous downstream processing or external integrations.",
+      steps: [
+        "Attacker uploads a crafted file via the file upload endpoint.",
+        "Background workers process the file and trigger webhooks or external APIs based on its contents.",
+        "Malformed content causes incorrect actions in external systems or data leaks."
+      ],
+      risk_level: "medium"
+    });
+  }
+
+  if (attack_paths.length === 0) {
+    attack_paths.push({
+      id: "path_generic",
+      description:
+        "Generic path from an external attacker through exposed interfaces to core data or admin functions.",
+      steps: [
+        "Attacker interacts with exposed interface (web/API).",
+        "Exploits validation/authn/authz gaps to gain broader access.",
+        "Moves laterally to access sensitive data or privileged operations."
+      ],
+      risk_level: "medium"
+    });
+  }
 
   const overall_risk_level = threats.some((t) => t.severity === "high")
     ? "high"
@@ -861,31 +1255,40 @@ function analyzeThreatModel(input) {
 
   const assumptions = [];
   if (/internet|public/i.test(architecture)) {
-    assumptions.push("External attackers can reach at least some endpoints over the public internet.");
+    assumptions.push(
+      "System exposes at least some endpoints to the public internet and must assume fully untrusted traffic."
+    );
   } else {
-    assumptions.push("System may primarily be used by internal or trusted parties, but insider threats remain relevant.");
+    assumptions.push(
+      "System may be primarily internal, but insider threats and credential compromise must still be considered."
+    );
   }
   if (/cloud|aws|gcp|azure/i.test(architecture)) {
-    assumptions.push("Cloud provider IAM and network segmentation are used to control access to infrastructure.");
+    assumptions.push(
+      "Cloud provider IAM and network-level controls are available for segmentation and least-privilege access."
+    );
   }
 
   const open_questions = [
-    "Which components are considered most business-critical from a confidentiality / integrity / availability standpoint?",
-    "Are there any known regulatory or compliance requirements (e.g., GDPR, PCI) that constrain design?",
-    "Which identities (human and machine) have access to admin endpoints or production data paths?"
+    "Which components are considered in-scope for initial rollout vs future phases?",
+    "For admin and operational interfaces, which roles exist and what actions are considered most sensitive?",
+    "Are there any regulatory drivers (e.g., GDPR, PCI, HIPAA) that change acceptable risk levels for specific data types?"
   ];
 
   return {
     summary: {
       key_assets: assets,
-      primary_attack_surfaces: attack_surfaces,
+      primary_attack_surfaces: attack_surfaces.map((s) => s.name),
       overall_risk_level
     },
     methodology:
-      "High-level STRIDE-style reasoning over the provided architecture summary, without detailed implementation knowledge.",
-    assumptions,
+      "Heuristic STRIDE-style analysis using architecture text to infer concrete components (auth, uploads, admin RBAC, integrations, DB, queues) and build feature-specific threats, attack paths, and mitigations.",
+    components,
+    assets,
     attack_surfaces,
     threats,
+    attack_paths,
+    assumptions,
     open_questions,
     timestamp_utc: new Date().toISOString()
   };
@@ -1042,69 +1445,129 @@ function analyzeDeploymentSafety(input) {
   };
 }
 
-/**
- * 5) verification_readiness_checklist
- */
-function analyzeVerificationReadiness(input) {
-  const artifact_url = input.artifact_url || "";
-  const chain = input.chain || "";
+// ---------------------------------------------------------------------------
+// Enrichment: call vuln_db + mitigation_playbook
+// ---------------------------------------------------------------------------
 
-  const items = [];
+async function enrichDeliverable(jobType, deliverable) {
+  try {
+    if (!deliverable || !jobType) return deliverable;
 
-  const addItem = (name, description, required) =>
-    items.push({ name, description, required });
+    if (jobType === "smart_contract_static_pattern_analysis") {
+      const findings = deliverable.findings || [];
+      await Promise.all(
+        findings.map(async (f) => {
+          const id = f.id;
+          if (!id) return;
 
-  addItem(
-    "Artifact URL reachable",
-    `Confirm that ${artifact_url || "the artifact URL"} is reachable and contains ABI, bytecode and metadata.`,
-    true
-  );
-  addItem(
-    "Compiler version + optimizer settings recorded",
-    "Ensure you have the exact Solidity/Vyper compiler version and optimizer config used at build time.",
-    true
-  );
-  addItem(
-    "Complete source tree available",
-    "Verify that all source files (contracts, libraries, interfaces) used during compilation are present.",
-    true
-  );
-  addItem(
-    "Constructor arguments captured",
-    "Record constructor arguments (human-readable and encoded) for verification tools.",
-    true
-  );
-  addItem(
-    "Linked library addresses documented",
-    "If using linked libraries, document names and on-chain addresses so the verifier can link them.",
-    false
-  );
-  addItem(
-    "Chain-specific explorer selected",
-    `Confirm which explorer/verifier will be used for ${
-      chain || "the target chain"
-    } and its required metadata format.`,
-    false
-  );
+          const vulnMeta = await fetchVulnMeta(id);
+          if (vulnMeta && typeof vulnMeta === "object") {
+            softMerge(f, vulnMeta);
+          }
 
-  const requiredCount = items.filter((i) => i.required).length;
-  const readiness_score = Math.round((requiredCount / items.length) * 100);
+          const mitMeta = await fetchMitigationMeta(id);
+          if (mitMeta && typeof mitMeta === "object") {
+            // Prefer remediation-related fields from mitigation_playbook
+            softMerge(f, {
+              suggestion:
+                mitMeta.remediation ||
+                mitMeta.mitigation ||
+                f.suggestion ||
+                undefined
+            });
+          }
+        })
+      );
+    }
 
-  const open_questions = [
-    "Has the verification process been rehearsed on a test deployment before attempting verification on the main deployment?",
-    "Who is responsible for performing and validating verification on the chosen explorer?"
-  ];
+    if (jobType === "devops_pipeline_security_review_v2") {
+      const threats = deliverable.threats || [];
+      await Promise.all(
+        threats.map(async (t) => {
+          const id = t.id;
+          if (!id) return;
 
-  return {
-    summary: {
-      chain,
-      readiness_score
-    },
-    items,
-    open_questions,
-    timestamp_utc: new Date().toISOString()
-  };
+          const vulnMeta = await fetchVulnMeta(id);
+          if (vulnMeta && typeof vulnMeta === "object") {
+            softMerge(t, vulnMeta);
+          }
+
+          const mitMeta = await fetchMitigationMeta(id);
+          if (mitMeta && typeof mitMeta === "object") {
+            softMerge(t, {
+              mitigation:
+                mitMeta.remediation ||
+                mitMeta.mitigation ||
+                t.mitigation ||
+                undefined
+            });
+          }
+        })
+      );
+    }
+
+    if (jobType === "threat_model_generator") {
+      const threats = deliverable.threats || [];
+      await Promise.all(
+        threats.map(async (t) => {
+          const id = t.id;
+          if (!id) return;
+
+          const vulnMeta = await fetchVulnMeta(id);
+          if (vulnMeta && typeof vulnMeta === "object") {
+            softMerge(t, vulnMeta);
+          }
+
+          const mitMeta = await fetchMitigationMeta(id);
+          if (mitMeta && typeof mitMeta === "object") {
+            softMerge(t, {
+              mitigation:
+                mitMeta.remediation ||
+                mitMeta.mitigation ||
+                t.mitigation ||
+                undefined
+            });
+          }
+        })
+      );
+    }
+
+    if (jobType === "deployment_safety_review") {
+      const risks = deliverable.risks || [];
+      await Promise.all(
+        risks.map(async (r) => {
+          const id = r.id;
+          if (!id) return;
+
+          const vulnMeta = await fetchVulnMeta(id);
+          if (vulnMeta && typeof vulnMeta === "object") {
+            softMerge(r, vulnMeta);
+          }
+
+          const mitMeta = await fetchMitigationMeta(id);
+          if (mitMeta && typeof mitMeta === "object") {
+            softMerge(r, {
+              suggestion:
+                mitMeta.remediation ||
+                mitMeta.mitigation ||
+                r.suggestion ||
+                undefined
+            });
+          }
+        })
+      );
+    }
+
+    return deliverable;
+  } catch (err) {
+    console.warn("⚠️ enrichDeliverable error:", err.message || err);
+    return deliverable;
+  }
 }
+
+// ---------------------------------------------------------------------------
+// ACP client wiring
+// ---------------------------------------------------------------------------
 
 async function main() {
   const privateKey = process.env.WHITELISTED_WALLET_PRIVATE_KEY;
@@ -1120,7 +1583,6 @@ async function main() {
   console.log("🔑 Seller Entity:", sellerEntityId);
   console.log("👛 Seller Wallet:", sellerWalletAddress);
 
-  // Use the V2 contract client
   const acpContractClient = await AcpContractClientV2.build(
     privateKey,
     sellerEntityId,
@@ -1179,7 +1641,6 @@ async function main() {
           const cachedRequirement = cached.requirement || {};
           const cachedName = cached.name || null;
 
-          // Prefer job.input if populated; otherwise use cached requirement
           let input =
             job.input && Object.keys(job.input).length
               ? job.input
@@ -1190,7 +1651,6 @@ async function main() {
             JSON.stringify(input, null, 2)
           );
 
-          // Infer job type from name first, then from input shape
           let jobType =
             inferJobTypeFromName(cachedName) || inferJobTypeFromInput(input);
           console.log(
@@ -1214,13 +1674,12 @@ async function main() {
           } else if (jobType === "deployment_safety_review") {
             console.log("🔍 Running deployment_safety_review");
             deliverable = analyzeDeploymentSafety(input);
-          } else if (jobType === "verification_readiness_checklist") {
-            console.log("🔍 Running verification_readiness_checklist");
-            deliverable = analyzeVerificationReadiness(input);
           } else {
-            // IMPORTANT: still deliver a review, not an "I don't know"
             deliverable = fallbackBestEffortDeliverable(input);
           }
+
+          // 🔁 Enrich from vuln_db + mitigation_playbook before delivering
+          deliverable = await enrichDeliverable(jobType, deliverable);
 
           await job.deliver(deliverable);
           console.log("✅ Job delivered:", job.id);
@@ -1240,7 +1699,7 @@ async function main() {
         "phase:",
         job.phase
       );
-      // Optional: add evaluator logic if SAIQUE ever acts as an evaluator.
+      // Optional evaluator logic in future.
     }
   });
 
